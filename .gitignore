@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+!.env.example
+firebase-admin-key.json
+*.pem
+*.key
+*.p12
+*.crt
+*.log
+.DS_Store
+dist/
+build/
+coverage/
