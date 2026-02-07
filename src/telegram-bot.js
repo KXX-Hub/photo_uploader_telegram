@@ -11,7 +11,11 @@ const os = require('os');
 // Initialize Firebase Admin
 if (!admin.apps.length) {
   const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-admin-key.json';
-  const serviceAccount = require(serviceAccountPath);
+  // Resolve from project cwd so env can use paths like ./firebase-admin-key.json reliably.
+  const resolvedServiceAccountPath = path.isAbsolute(serviceAccountPath)
+    ? serviceAccountPath
+    : path.resolve(process.cwd(), serviceAccountPath);
+  const serviceAccount = require(resolvedServiceAccountPath);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
@@ -33,9 +37,22 @@ const r2Client = new S3Client({
 
 const R2_BUCKET = process.env.R2_BUCKET_NAME;
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
+const R2_OBJECT_PREFIX = (process.env.R2_OBJECT_PREFIX || 'photos').replace(/^\/+|\/+$/g, '');
+const ENABLE_REVERSE_GEOCODE = process.env.ENABLE_REVERSE_GEOCODE !== 'false';
+const geocodeCache = new Map();
+const GEOCODE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function getGeocodeCacheKey(lat, lon) {
+  return `${Number(lat).toFixed(4)},${Number(lon).toFixed(4)}`;
+}
 
 // Reverse geocoding function
 async function reverseGeocode(lat, lon) {
+  const cacheKey = getGeocodeCacheKey(lat, lon);
+  const cached = geocodeCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < GEOCODE_CACHE_TTL_MS) {
+    return cached.location;
+  }
   try {
     const response = await axios.get('https://nominatim.openstreetmap.org/reverse', {
       params: {
@@ -47,14 +64,18 @@ async function reverseGeocode(lat, lon) {
       },
       headers: {
         'User-Agent': 'KXX-Photo-Bot/1.0'
-      }
+      },
+      // Keep bot responsive; skip reverse geocode if service is slow.
+      timeout: 2000
     });
 
     if (response.data && response.data.address) {
       const addr = response.data.address;
       const city = addr.city || addr.town || addr.village || addr.municipality || '';
       const country = addr.country || '';
-      return `${city}, ${country}`.trim();
+      const location = `${city}, ${country}`.trim();
+      geocodeCache.set(cacheKey, { location, ts: Date.now() });
+      return location;
     }
     return null;
   } catch (error) {
@@ -78,12 +99,19 @@ function parseLocationFromText(text) {
 // Process photo
 async function processPhoto(photo, caption, ctx) {
   try {
+    const t0 = Date.now();
+    const mark = (label) => console.log(`⏱️ ${label}: ${Date.now() - t0}ms`);
+
     // Download photo
     const file = await ctx.telegram.getFile(photo.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     
-    const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    const response = await axios.get(fileUrl, {
+      responseType: 'arraybuffer',
+      timeout: 15000
+    });
     const buffer = Buffer.from(response.data);
+    mark('download');
     
     // Detect file type - support multiple formats
     const fileName = photo.file_name?.toLowerCase() || '';
@@ -120,44 +148,17 @@ async function processPhoto(photo, caption, ctx) {
 
     // Extract EXIF data
     try {
-      // Try exifr first with translateKeys
+      // Fast path: one parse is usually enough.
       exifData = await exifr.parse(buffer, {
         translateKeys: true,
         translateValues: true,
         reviveValues: true,
         sanitize: true
       }) || {};
-
-      // If no data, try without translateKeys
-      if (Object.keys(exifData).length === 0) {
-        exifData = await exifr.parse(buffer, {
-          translateKeys: false,
-          translateValues: false
-        }) || {};
-      }
-
-      // Try sharp metadata
-      if (Object.keys(exifData).length === 0) {
-        const metadata = await sharp(buffer).metadata();
-        if (metadata.exif) {
-          exifData = metadata;
-        }
-      }
-
-      // Try sharp EXIF buffer
-      if (Object.keys(exifData).length === 0) {
-        try {
-          const exifBuffer = await sharp(buffer).exif();
-          if (exifBuffer) {
-            exifData = await exifr.parse(exifBuffer);
-          }
-        } catch (e) {
-          // Ignore
-        }
-      }
     } catch (error) {
       console.error('EXIF extraction error:', error.message);
     }
+    mark('exif');
 
     // Process HEIC/HEIF files
     if (isHeic) {
@@ -230,6 +231,7 @@ async function processPhoto(photo, caption, ctx) {
         .rotate() // Auto-rotate based on EXIF orientation
         .toBuffer();
     }
+    mark('normalize');
 
     // Extract GPS coordinates
     let gps = null;
@@ -247,31 +249,31 @@ async function processPhoto(photo, caption, ctx) {
 
     // Get location from GPS or caption
     let location = parseLocationFromText(caption);
-    if (!location && gps) {
+    if (!location && gps && ENABLE_REVERSE_GEOCODE) {
       location = await reverseGeocode(gps.latitude, gps.longitude);
     }
+    mark('location');
 
     // Extract device info
     const device = exifData.Make && exifData.Model 
       ? `${exifData.Make} ${exifData.Model}`.trim()
       : exifData.Model || exifData.Make || null;
 
-    // Compress image to WebP (much smaller file size)
-    // Note: processedBuffer already has orientation applied, so no need to rotate again
-    const compressedBuffer = await sharp(processedBuffer)
-      .resize(2000, 2000, { 
-        fit: 'inside',
-        withoutEnlargement: true 
-      })
-      .webp({ quality: 85, effort: 6 })
-      .toBuffer();
-
-    // Generate thumbnail in WebP
-    // Note: processedBuffer already has orientation applied, so no need to rotate again
-    const thumbnailBuffer = await sharp(processedBuffer)
-      .resize(400, 400, { fit: 'inside' })
-      .webp({ quality: 80, effort: 6 })
-      .toBuffer();
+    // Compress and thumbnail in parallel to reduce response latency.
+    const [compressedBuffer, thumbnailBuffer] = await Promise.all([
+      sharp(processedBuffer)
+        .resize(2000, 2000, {
+          fit: 'inside',
+          withoutEnlargement: true
+        })
+        .webp({ quality: 85, effort: 4 })
+        .toBuffer(),
+      sharp(processedBuffer)
+        .resize(400, 400, { fit: 'inside' })
+        .webp({ quality: 80, effort: 2 })
+        .toBuffer()
+    ]);
+    mark('compress');
 
     // Generate filename using original filename (存到 photos/ 資料夾)
     let baseFilename = '';
@@ -288,8 +290,8 @@ async function processPhoto(photo, caption, ctx) {
       baseFilename = `photo_${timestamp}_${randomStr}`;
     }
     
-    const filename = `photos/${baseFilename}.webp`;
-    const thumbFilename = `photos/thumb_${baseFilename}.webp`;
+    const filename = `${R2_OBJECT_PREFIX}/${baseFilename}.webp`;
+    const thumbFilename = `${R2_OBJECT_PREFIX}/thumb_${baseFilename}.webp`;
 
     // Step 1: Upload photos to R2 (存照片到 R2)
     console.log('📤 Uploading to R2...');
@@ -321,6 +323,7 @@ async function processPhoto(photo, caption, ctx) {
       console.error('❌ R2 Upload Error:', uploadError);
       throw new Error(`Failed to upload to R2: ${uploadError.message}`);
     }
+    mark('r2-upload');
 
     // Step 2: Prepare photo information for Firestore
     const photoUrl = `${R2_PUBLIC_URL}/${filename}`;
@@ -329,12 +332,11 @@ async function processPhoto(photo, caption, ctx) {
     // Prepare EXIF data for PhotosPage (匹配 PhotosPage 的數據結構)
     const settings = {};
     if (exifData.FNumber !== undefined) {
-      // Format aperture to 1 decimal place (e.g., f/1.8 instead of f/1.7799999713880652)
       const fNumber = typeof exifData.FNumber === 'number' ? exifData.FNumber : parseFloat(exifData.FNumber);
-      settings.aperture = `f/${fNumber.toFixed(1)}`;
+      if (!Number.isNaN(fNumber)) settings.aperture = `f/${Math.round(fNumber)}`;
     } else if (exifData.ApertureValue !== undefined) {
       const apertureValue = typeof exifData.ApertureValue === 'number' ? exifData.ApertureValue : parseFloat(exifData.ApertureValue);
-      settings.aperture = `f/${apertureValue.toFixed(1)}`;
+      if (!Number.isNaN(apertureValue)) settings.aperture = `f/${Math.round(apertureValue)}`;
     }
     
     if (exifData.ExposureTime !== undefined) {
@@ -415,6 +417,7 @@ async function processPhoto(photo, caption, ctx) {
     console.log('💾 Saving to Firestore...');
     await db.collection('photos').add(photoData);
     console.log('✅ Saved to Firestore');
+    mark('firestore-write');
 
     // Send confirmation message
     const exifCount = Object.keys(exifData).length;
@@ -425,6 +428,7 @@ async function processPhoto(photo, caption, ctx) {
       (gps ? `🗺️ GPS: ${gps.latitude.toFixed(6)}, ${gps.longitude.toFixed(6)}\n` : '') +
       `📋 EXIF keys: ${exifCount}\n\n` +
       `💡 Tip: To preserve EXIF data, send photos as files instead of images.`;
+    mark('total');
 
     return message;
   } catch (error) {
@@ -435,6 +439,17 @@ async function processPhoto(photo, caption, ctx) {
 
 // Initialize bot
 function initialize(bot) {
+  async function safeReply(ctx, text) {
+    try {
+      const sent = await ctx.reply(text);
+      console.log(`✅ Reply sent to chat ${ctx.chat?.id}, message ${sent.message_id}`);
+      return sent;
+    } catch (error) {
+      console.error(`❌ Reply failed for chat ${ctx.chat?.id}:`, error?.description || error.message);
+      throw error;
+    }
+  }
+
   // Handle photo messages
   bot.on('photo', async (ctx) => {
     try {
@@ -442,13 +457,13 @@ function initialize(bot) {
       const caption = ctx.message.caption || '';
       
       console.log('📸 Received photo from user:', ctx.from.id);
-      await ctx.reply('📸 Processing photo...');
+      await safeReply(ctx, '📸 Photo received. Processing now (usually 3-10 seconds)...');
       const message = await processPhoto(photo, caption, ctx);
-      await ctx.reply(message);
+      await safeReply(ctx, message);
     } catch (error) {
       console.error('❌ Error processing photo:', error);
       console.error('Error stack:', error.stack);
-      await ctx.reply('❌ Error processing photo: ' + error.message);
+      await safeReply(ctx, '❌ Error processing photo: ' + error.message);
     }
   });
 
@@ -468,16 +483,16 @@ function initialize(bot) {
                          imageExtensions.some(ext => fileName.endsWith(ext));
       
       if (isImageFile) {
-        await ctx.reply('📸 Processing photo...');
+        await safeReply(ctx, '📸 Photo received. Processing now (usually 3-10 seconds)...');
         const message = await processPhoto(doc, ctx.message.caption || '', ctx);
-        await ctx.reply(message);
+        await safeReply(ctx, message);
       } else {
-        await ctx.reply('❌ Unsupported file format. Please send an image file.');
+        await safeReply(ctx, '❌ Unsupported file format. Please send an image file.');
       }
     } catch (error) {
       console.error('❌ Error processing document:', error);
       console.error('Error stack:', error.stack);
-      await ctx.reply('❌ Error processing document: ' + error.message);
+      await safeReply(ctx, '❌ Error processing document: ' + error.message);
     }
   });
 
