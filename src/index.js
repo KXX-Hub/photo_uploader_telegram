@@ -32,7 +32,7 @@ async function start() {
         // Avoid processing stale queued updates after restarts.
         dropPendingUpdates: true
       }),
-      15000,
+      70000,
       'Bot launch'
     );
 
