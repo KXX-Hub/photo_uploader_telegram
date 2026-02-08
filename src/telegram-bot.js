@@ -10,12 +10,27 @@ const os = require('os');
 
 // Initialize Firebase Admin
 if (!admin.apps.length) {
-  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-admin-key.json';
-  // Resolve from project cwd so env can use paths like ./firebase-admin-key.json reliably.
-  const resolvedServiceAccountPath = path.isAbsolute(serviceAccountPath)
-    ? serviceAccountPath
-    : path.resolve(process.cwd(), serviceAccountPath);
-  const serviceAccount = require(resolvedServiceAccountPath);
+  const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
+  const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  let serviceAccount;
+  if (firebaseProjectId && firebaseClientEmail && firebasePrivateKey) {
+    serviceAccount = {
+      projectId: firebaseProjectId,
+      clientEmail: firebaseClientEmail,
+      // Koyeb env usually stores literal \n, convert to real line breaks.
+      privateKey: firebasePrivateKey.replace(/\\n/g, '\n')
+    };
+  } else {
+    const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-admin-key.json';
+    // Resolve from project cwd so env can use paths like ./firebase-admin-key.json reliably.
+    const resolvedServiceAccountPath = path.isAbsolute(serviceAccountPath)
+      ? serviceAccountPath
+      : path.resolve(process.cwd(), serviceAccountPath);
+    serviceAccount = require(resolvedServiceAccountPath);
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
