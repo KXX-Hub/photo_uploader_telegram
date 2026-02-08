@@ -27,14 +27,11 @@ async function start() {
     const me = await withTimeout(bot.telegram.getMe(), 15000, 'Telegram getMe');
     console.log(`✅ Bot auth OK: @${me.username} (${me.id})`);
 
-    await withTimeout(
-      bot.launch({
-        // Avoid processing stale queued updates after restarts.
-        dropPendingUpdates: true
-      }),
-      70000,
-      'Bot launch'
-    );
+    console.log('🚀 Starting polling...');
+    await bot.launch({
+      // Avoid processing stale queued updates after restarts.
+      dropPendingUpdates: true
+    });
 
     console.log('🤖 Telegram bot is running (polling, dropPendingUpdates=true)...');
   } catch (error) {

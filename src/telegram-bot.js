@@ -35,9 +35,28 @@ const r2Client = new S3Client({
   },
 });
 
-const R2_BUCKET = process.env.R2_BUCKET_NAME;
+const R2_BUCKET = (process.env.R2_BUCKET_NAME || '').split('/').filter(Boolean)[0];
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
-const R2_OBJECT_PREFIX = (process.env.R2_OBJECT_PREFIX || 'photos').replace(/^\/+|\/+$/g, '');
+const R2_OBJECT_PREFIX = (process.env.R2_OBJECT_PREFIX || '').replace(/^\/+|\/+$/g, '');
+const R2_ORIGINALS_PREFIX = (process.env.R2_ORIGINALS_PREFIX || 'originals').replace(/^\/+|\/+$/g, '');
+const R2_THUMBNAILS_PREFIX = (process.env.R2_THUMBNAILS_PREFIX || 'thumbnails').replace(/^\/+|\/+$/g, '');
+
+function buildObjectKey(folder, fileName) {
+  return [R2_OBJECT_PREFIX, folder, fileName].filter(Boolean).join('/');
+}
+
+function formatApertureToOneDecimal(value) {
+  const num = typeof value === 'number' ? value : parseFloat(value);
+  if (Number.isNaN(num)) return null;
+  const rounded = Math.round(num * 10) / 10;
+  return `f/${rounded.toFixed(1)}`;
+}
+
+function roundToOneDecimal(value) {
+  const num = typeof value === 'number' ? value : parseFloat(value);
+  if (Number.isNaN(num)) return null;
+  return Math.round(num * 10) / 10;
+}
 const ENABLE_REVERSE_GEOCODE = process.env.ENABLE_REVERSE_GEOCODE !== 'false';
 const geocodeCache = new Map();
 const GEOCODE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -269,13 +288,13 @@ async function processPhoto(photo, caption, ctx) {
         .webp({ quality: 85, effort: 4 })
         .toBuffer(),
       sharp(processedBuffer)
-        .resize(400, 400, { fit: 'inside' })
-        .webp({ quality: 80, effort: 2 })
+        .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 82, effort: 4 })
         .toBuffer()
     ]);
     mark('compress');
 
-    // Generate filename using original filename (存到 photos/ 資料夾)
+    // Generate filename using original filename
     let baseFilename = '';
     if (fileName && fileName.trim()) {
       // Use original filename, remove extension and add .webp
@@ -290,8 +309,8 @@ async function processPhoto(photo, caption, ctx) {
       baseFilename = `photo_${timestamp}_${randomStr}`;
     }
     
-    const filename = `${R2_OBJECT_PREFIX}/${baseFilename}.webp`;
-    const thumbFilename = `${R2_OBJECT_PREFIX}/thumb_${baseFilename}.webp`;
+    const filename = buildObjectKey(R2_ORIGINALS_PREFIX, `${baseFilename}.webp`);
+    const thumbFilename = buildObjectKey(R2_THUMBNAILS_PREFIX, `${baseFilename}.webp`);
 
     // Step 1: Upload photos to R2 (存照片到 R2)
     console.log('📤 Uploading to R2...');
@@ -332,11 +351,11 @@ async function processPhoto(photo, caption, ctx) {
     // Prepare EXIF data for PhotosPage (匹配 PhotosPage 的數據結構)
     const settings = {};
     if (exifData.FNumber !== undefined) {
-      const fNumber = typeof exifData.FNumber === 'number' ? exifData.FNumber : parseFloat(exifData.FNumber);
-      if (!Number.isNaN(fNumber)) settings.aperture = `f/${Math.round(fNumber)}`;
+      const aperture = formatApertureToOneDecimal(exifData.FNumber);
+      if (aperture) settings.aperture = aperture;
     } else if (exifData.ApertureValue !== undefined) {
-      const apertureValue = typeof exifData.ApertureValue === 'number' ? exifData.ApertureValue : parseFloat(exifData.ApertureValue);
-      if (!Number.isNaN(apertureValue)) settings.aperture = `f/${Math.round(apertureValue)}`;
+      const aperture = formatApertureToOneDecimal(exifData.ApertureValue);
+      if (aperture) settings.aperture = aperture;
     }
     
     if (exifData.ExposureTime !== undefined) {
@@ -402,8 +421,8 @@ async function processPhoto(photo, caption, ctx) {
     
     // Also keep exif for backward compatibility
     const exifInfo = {};
-    if (exifData.FNumber !== undefined) exifInfo.aperture = exifData.FNumber;
-    else if (exifData.ApertureValue !== undefined) exifInfo.aperture = exifData.ApertureValue;
+    if (exifData.FNumber !== undefined) exifInfo.aperture = roundToOneDecimal(exifData.FNumber);
+    else if (exifData.ApertureValue !== undefined) exifInfo.aperture = roundToOneDecimal(exifData.ApertureValue);
     if (exifData.ExposureTime !== undefined) exifInfo.shutterSpeed = exifData.ExposureTime;
     else if (exifData.ShutterSpeedValue !== undefined) exifInfo.shutterSpeed = exifData.ShutterSpeedValue;
     if (exifData.ISO !== undefined) exifInfo.iso = exifData.ISO;
@@ -439,6 +458,14 @@ async function processPhoto(photo, caption, ctx) {
 
 // Initialize bot
 function initialize(bot) {
+  bot.use(async (ctx, next) => {
+    const updateType = ctx.updateType || 'unknown';
+    const fromId = ctx.from?.id || 'unknown';
+    const chatId = ctx.chat?.id || 'unknown';
+    console.log(`📩 Update received: type=${updateType} from=${fromId} chat=${chatId}`);
+    return next();
+  });
+
   async function safeReply(ctx, text) {
     try {
       const sent = await ctx.reply(text);
@@ -457,7 +484,7 @@ function initialize(bot) {
       const caption = ctx.message.caption || '';
       
       console.log('📸 Received photo from user:', ctx.from.id);
-      await safeReply(ctx, '📸 Photo received. Processing now (usually 3-10 seconds)...');
+      await safeReply(ctx, '📸 Processing...');
       const message = await processPhoto(photo, caption, ctx);
       await safeReply(ctx, message);
     } catch (error) {
@@ -483,7 +510,7 @@ function initialize(bot) {
                          imageExtensions.some(ext => fileName.endsWith(ext));
       
       if (isImageFile) {
-        await safeReply(ctx, '📸 Photo received. Processing now (usually 3-10 seconds)...');
+        await safeReply(ctx, '📸 Processing...');
         const message = await processPhoto(doc, ctx.message.caption || '', ctx);
         await safeReply(ctx, message);
       } else {
