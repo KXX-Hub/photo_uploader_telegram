@@ -130,26 +130,14 @@ function parseLocationFromText(text) {
   return null;
 }
 
-// Process photo
-async function processPhoto(photo, caption, ctx) {
+// Core photo processing — accepts a buffer directly (used by both Telegram bot and web upload)
+async function processPhotoBuffer(buffer, fileName, mimeType, caption) {
+  fileName = (fileName || '').toLowerCase();
+  mimeType = (mimeType || '').toLowerCase();
+
   try {
     const t0 = Date.now();
     const mark = (label) => console.log(`⏱️ ${label}: ${Date.now() - t0}ms`);
-
-    // Download photo
-    const file = await ctx.telegram.getFile(photo.file_id);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    
-    const response = await axios.get(fileUrl, {
-      responseType: 'arraybuffer',
-      timeout: 15000
-    });
-    const buffer = Buffer.from(response.data);
-    mark('download');
-    
-    // Detect file type - support multiple formats
-    const fileName = photo.file_name?.toLowerCase() || '';
-    const mimeType = photo.mime_type?.toLowerCase() || '';
     
     // Check for HEIC/HEIF
     const isHeic = fileName.endsWith('.heic') || 
@@ -453,7 +441,7 @@ async function processPhoto(photo, caption, ctx) {
     console.log('✅ Saved to Firestore');
     mark('firestore-write');
 
-    // Send confirmation message
+    // Build result message
     const exifCount = Object.keys(exifData).length;
     const message = `✅ Photo uploaded successfully!\n\n` +
       `📊 Compression: ${photoData.compressionRatio}% smaller\n` +
@@ -469,6 +457,15 @@ async function processPhoto(photo, caption, ctx) {
     console.error('Photo processing error:', error);
     throw error;
   }
+}
+
+// Telegram-specific wrapper: downloads file from Telegram then calls processPhotoBuffer
+async function processPhoto(photo, caption, ctx) {
+  const file = await ctx.telegram.getFile(photo.file_id);
+  const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+  const response = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 15000 });
+  const buffer = Buffer.from(response.data);
+  return processPhotoBuffer(buffer, photo.file_name || '', photo.mime_type || '', caption);
 }
 
 // Initialize bot
@@ -555,5 +552,6 @@ function initialize(bot) {
 }
 
 module.exports = {
-  initialize
+  initialize,
+  processPhotoBuffer
 };
