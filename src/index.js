@@ -318,6 +318,8 @@ function handleUpload(req, res) {
   let fileName = '';
   let mimeType = '';
   let caption = '';
+  const exifOverrides = {};
+  const EXIF_FIELDS = ['date', 'device', 'aperture', 'shutter', 'iso', 'focalLength', 'latitude', 'longitude'];
 
   busboy.on('file', (fieldName, fileStream, info) => {
     fileName = info.filename || '';
@@ -329,6 +331,7 @@ function handleUpload(req, res) {
 
   busboy.on('field', (name, value) => {
     if (name === 'caption') caption = value;
+    else if (EXIF_FIELDS.includes(name) && value) exifOverrides[name] = value;
   });
 
   busboy.on('close', async () => {
@@ -338,7 +341,7 @@ function handleUpload(req, res) {
       return;
     }
     try {
-      const message = await telegramBot.processPhotoBuffer(fileBuffer, fileName, mimeType, caption);
+      const message = await telegramBot.processPhotoBuffer(fileBuffer, fileName, mimeType, caption, exifOverrides);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ success: true, message }));
     } catch (err) {

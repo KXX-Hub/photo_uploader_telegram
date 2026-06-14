@@ -131,7 +131,7 @@ function parseLocationFromText(text) {
 }
 
 // Core photo processing — accepts a buffer directly (used by both Telegram bot and web upload)
-async function processPhotoBuffer(buffer, fileName, mimeType, caption) {
+async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverrides = {}) {
   fileName = (fileName || '').toLowerCase();
   mimeType = (mimeType || '').toLowerCase();
 
@@ -166,7 +166,7 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption) {
 
     let exifData = {};
     let processedBuffer = buffer;
-    let finalMimeType = photo.mime_type || 'image/jpeg';
+    let finalMimeType = mimeType || 'image/jpeg';
 
     // Extract EXIF data
     try {
@@ -277,7 +277,7 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption) {
     mark('location');
 
     // Extract device info
-    const device = exifData.Make && exifData.Model 
+    let device = exifData.Make && exifData.Model
       ? `${exifData.Make} ${exifData.Model}`.trim()
       : exifData.Model || exifData.Make || null;
 
@@ -396,6 +396,24 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption) {
       const minutes = String(date.getMinutes()).padStart(2, '0');
       const seconds = String(date.getSeconds()).padStart(2, '0');
       dateStr = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+    }
+
+    // Apply client-provided EXIF overrides (fallback for formats where buffer EXIF is unavailable)
+    if (!device && exifOverrides.device) device = exifOverrides.device;
+    if (!dateStr && exifOverrides.date) dateStr = exifOverrides.date;
+    if (!settings.aperture && exifOverrides.aperture) settings.aperture = exifOverrides.aperture;
+    if (!settings.shutter && exifOverrides.shutter) settings.shutter = exifOverrides.shutter;
+    if (!settings.iso && exifOverrides.iso) settings.iso = `ISO ${exifOverrides.iso}`;
+    if (!settings.focalLength && exifOverrides.focalLength) settings.focalLength = exifOverrides.focalLength;
+    if (!gps && exifOverrides.latitude != null && exifOverrides.longitude != null) {
+      const lat = parseFloat(exifOverrides.latitude);
+      const lon = parseFloat(exifOverrides.longitude);
+      if (!isNaN(lat) && !isNaN(lon)) {
+        gps = { latitude: lat, longitude: lon };
+        if (!location && ENABLE_REVERSE_GEOCODE) {
+          location = await reverseGeocode(lat, lon);
+        }
+      }
     }
 
     // Step 3: Prepare data to save in Firestore (存網址和資訊到 Firestore)
