@@ -3,20 +3,39 @@
 const axios = require('axios');
 const { processPhotoBuffer } = require('./photo-service');
 
-// Optional Telegram allowlist: comma-separated user IDs in TELEGRAM_ALLOWED_USER_IDS.
+// Telegram allowlist: comma-separated user IDs in TELEGRAM_ALLOWED_USER_IDS.
+// Required: with no IDs set, the bot ignores every update (fails closed).
 const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
   .split(',')
   .map((id) => id.trim())
   .filter(Boolean);
 
+// The file URL embeds the bot token. Errors from downloading it (axios keeps
+// the URL in config/request) must never reach a log or a reply as-is.
+const MAX_TELEGRAM_FILE_BYTES = 50 * 1024 * 1024;
+const redactToken = (text) => String(text || '').split(process.env.TELEGRAM_BOT_TOKEN || '\u0000').join('<bot-token>');
+
 // Telegram-specific wrapper: downloads file from Telegram then calls processPhotoBuffer
 async function processPhoto(photo, caption, ctx) {
   const file = await ctx.telegram.getFile(photo.file_id);
   const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-  const response = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 15000 });
+  let response;
+  try {
+    response = await axios.get(fileUrl, {
+      responseType: 'arraybuffer',
+      timeout: 30000,
+      maxContentLength: MAX_TELEGRAM_FILE_BYTES,
+      maxRedirects: 0,
+    });
+  } catch (err) {
+    throw new Error(`Could not download the file from Telegram (${redactToken(err.code || err.message)})`);
+  }
   const buffer = Buffer.from(response.data);
-  return processPhotoBuffer(buffer, photo.file_name || '', photo.mime_type || '', caption);
+  return processPhotoBuffer(buffer, String(photo.file_name || '').slice(0, 255), photo.mime_type || '', String(caption || '').slice(0, 200));
 }
+
+// Logs an error without stack details that could carry the token.
+const logError = (label, error) => console.error(label, redactToken(error?.message));
 
 // Initialize bot
 function initialize(bot) {
@@ -25,7 +44,7 @@ function initialize(bot) {
     const fromId = ctx.from?.id || 'unknown';
     const chatId = ctx.chat?.id || 'unknown';
     console.log(`📩 Update received: type=${updateType} from=${fromId} chat=${chatId}`);
-    if (TELEGRAM_ALLOWED_USER_IDS.length && !TELEGRAM_ALLOWED_USER_IDS.includes(String(ctx.from?.id))) {
+    if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(ctx.from?.id))) {
       console.warn(`🚫 Ignoring update from user ${fromId} (not in TELEGRAM_ALLOWED_USER_IDS)`);
       if (ctx.chat) await ctx.reply('🚫 This bot is private.').catch(() => {});
       return;
@@ -34,7 +53,7 @@ function initialize(bot) {
   });
 
   if (!TELEGRAM_ALLOWED_USER_IDS.length) {
-    console.warn('⚠️ TELEGRAM_ALLOWED_USER_IDS is not set: anyone who finds this bot can upload photos.');
+    console.warn('⚠️ TELEGRAM_ALLOWED_USER_IDS is not set: the bot will ignore every message until it is.');
   }
 
   async function safeReply(ctx, text) {
@@ -59,9 +78,8 @@ function initialize(bot) {
       const { message } = await processPhoto(photo, caption, ctx);
       await safeReply(ctx, message);
     } catch (error) {
-      console.error('❌ Error processing photo:', error);
-      console.error('Error stack:', error.stack);
-      await safeReply(ctx, '❌ Error processing photo: ' + error.message);
+      logError('❌ Error processing photo:', error);
+      await safeReply(ctx, '❌ Could not process that photo. Try again, or send it as a file.');
     }
   });
 
@@ -88,9 +106,8 @@ function initialize(bot) {
         await safeReply(ctx, '❌ Unsupported file format. Please send an image file.');
       }
     } catch (error) {
-      console.error('❌ Error processing document:', error);
-      console.error('Error stack:', error.stack);
-      await safeReply(ctx, '❌ Error processing document: ' + error.message);
+      logError('❌ Error processing document:', error);
+      await safeReply(ctx, '❌ Could not process that file. Try again with a JPEG, PNG, HEIC or RAW image.');
     }
   });
 

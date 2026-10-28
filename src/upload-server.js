@@ -313,13 +313,22 @@ function secretMatches(provided) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// The allowlist is cached for a minute so a flood of (valid-looking) tokens
+// can't turn into a Firestore read per request.
+const ALLOWLIST_TTL_MS = 60 * 1000;
+let allowlistCache = { emails: null, at: 0 };
+
 async function getAllowedEmails() {
+  if (allowlistCache.emails && Date.now() - allowlistCache.at < ALLOWLIST_TTL_MS) {
+    return allowlistCache.emails;
+  }
   const allowed = new Set(ADMIN_EMAILS);
   try {
     const snap = await photoService.db.collection('settings').doc('dashboard_auth').get();
     const data = snap.exists ? snap.data() : {};
     (Array.isArray(data.allowedEmails) ? data.allowedEmails : []).forEach((e) => allowed.add(String(e).trim().toLowerCase()));
     if (data.allowedEmail) allowed.add(String(data.allowedEmail).trim().toLowerCase());
+    allowlistCache = { emails: allowed, at: Date.now() };
   } catch (err) {
     console.error('❌ Could not read dashboard allowlist:', err.message);
   }
@@ -329,7 +338,7 @@ async function getAllowedEmails() {
 async function authorize(req) {
   const header = req.headers['authorization'] || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!token) return null;
+  if (!token || token.length > 4096) return null;
   if (secretMatches(token)) return { via: 'secret' };
 
   try {
@@ -343,91 +352,135 @@ async function authorize(req) {
   }
 }
 
-function sendJSON(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json' });
+// Sends at most one response per request, so an error raised after a reply
+// (e.g. busboy firing 'error' and then 'close') can't crash the process.
+function sendJSON(res, status, body, extraHeaders = {}) {
+  if (res.headersSent || res.writableEnded) return;
+  res.writeHead(status, { 'content-type': 'application/json', ...extraHeaders });
   res.end(JSON.stringify(body));
 }
 
+// Rejected requests aren't read: reply, then drop the connection.
+function refuse(req, res, status, error) {
+  sendJSON(res, status, { error }, { connection: 'close' });
+  req.on('error', () => {});
+  setImmediate(() => req.destroy());
+}
+
 // ─── Web Upload: POST /upload handler ────────────────────────────────────────
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_FIELD_CHARS = 200;
+const EXIF_FIELDS = ['date', 'device', 'aperture', 'shutter', 'iso', 'focalLength', 'latitude', 'longitude'];
+
+// One photo is processed at a time; others wait their turn. Decoding large
+// images is memory-heavy, so this keeps a burst of uploads from exhausting it.
+let processing = Promise.resolve();
+const runExclusive = (task) => {
+  const run = processing.then(task, task);
+  processing = run.catch(() => {});
+  return run;
+};
+
 async function handleUpload(req, res) {
   if (!(await authorize(req))) {
-    req.resume();
-    sendJSON(res, 401, { error: 'Unauthorized' });
+    refuse(req, res, 401, 'Unauthorized');
+    return;
+  }
+
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > MAX_UPLOAD_BYTES + 64 * 1024) {
+    refuse(req, res, 413, 'File too large (50 MB max)');
     return;
   }
 
   let busboy;
   try {
-    busboy = Busboy({ headers: req.headers, limits: { fileSize: 50 * 1024 * 1024 } });
-  } catch (err) {
-    res.writeHead(400, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Bad request: ' + err.message }));
+    busboy = Busboy({
+      headers: req.headers,
+      limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 20, fieldSize: 2048, parts: 25, fieldNameSize: 50 },
+    });
+  } catch {
+    refuse(req, res, 400, 'Expected a multipart/form-data upload');
     return;
   }
+
+  let failed = false;
+  const fail = (status, error) => {
+    if (failed) return;
+    failed = true;
+    refuse(req, res, status, error);
+  };
 
   let fileBuffer = null;
   let fileName = '';
   let mimeType = '';
   let caption = '';
   const exifOverrides = {};
-  const EXIF_FIELDS = ['date', 'device', 'aperture', 'shutter', 'iso', 'focalLength', 'latitude', 'longitude'];
 
   busboy.on('file', (fieldName, fileStream, info) => {
-    fileName = info.filename || '';
-    mimeType = info.mimeType || '';
+    fileName = String(info.filename || '').slice(0, 255);
+    mimeType = String(info.mimeType || '').slice(0, 100);
     const chunks = [];
-    fileStream.on('data', chunk => chunks.push(chunk));
-    fileStream.on('close', () => { fileBuffer = Buffer.concat(chunks); });
+    fileStream.on('data', (chunk) => chunks.push(chunk));
+    fileStream.on('limit', () => fail(413, 'File too large (50 MB max)'));
+    fileStream.on('error', () => fail(400, 'Upload was interrupted'));
+    fileStream.on('close', () => {
+      if (!fileStream.truncated) fileBuffer = Buffer.concat(chunks);
+    });
   });
 
   busboy.on('field', (name, value) => {
-    if (name === 'caption') caption = value;
-    else if (EXIF_FIELDS.includes(name) && value) exifOverrides[name] = value;
+    const text = String(value || '').slice(0, MAX_FIELD_CHARS);
+    if (name === 'caption') caption = text;
+    else if (EXIF_FIELDS.includes(name) && text) exifOverrides[name] = text;
   });
 
+  busboy.on('partsLimit', () => fail(400, 'Too many form parts'));
+  busboy.on('filesLimit', () => fail(400, 'Send one photo per request'));
+  busboy.on('fieldsLimit', () => fail(400, 'Too many form fields'));
+  busboy.on('error', () => fail(400, 'Upload could not be read'));
+
   busboy.on('close', async () => {
+    if (failed) return;
     if (!fileBuffer || fileBuffer.length === 0) {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'No file received' }));
+      sendJSON(res, 400, { error: 'No file received' });
       return;
     }
     try {
-      const { message, id } = await photoService.processPhotoBuffer(fileBuffer, fileName, mimeType, caption, exifOverrides);
+      const { message, id } = await runExclusive(() =>
+        photoService.processPhotoBuffer(fileBuffer, fileName, mimeType, caption, exifOverrides)
+      );
       sendJSON(res, 200, { success: true, message, id });
     } catch (err) {
-      console.error('❌ Web upload error:', err);
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      // Details stay in the server log; the client gets a plain message.
+      console.error('❌ Web upload error:', err.message);
+      sendJSON(res, err.statusCode || 500, { error: err.publicMessage || 'Upload failed. Try again, or try a different file.' });
     }
   });
 
-  busboy.on('error', err => {
-    console.error('❌ Busboy error:', err);
-    res.writeHead(500, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Upload parsing failed' }));
-  });
-
+  req.on('error', () => fail(400, 'Upload was interrupted'));
   req.pipe(busboy);
 }
 
 // ─── Web: DELETE /photos/:id handler ─────────────────────────────────────────
 async function handleDelete(req, res, photoId) {
   if (!(await authorize(req))) {
-    sendJSON(res, 401, { error: 'Unauthorized' });
+    refuse(req, res, 401, 'Unauthorized');
     return;
   }
   try {
     const result = await photoService.deletePhoto(photoId);
     sendJSON(res, 200, { success: true, ...result });
   } catch (err) {
-    console.error('❌ Delete error:', err);
-    sendJSON(res, err.statusCode || 500, { error: err.message });
+    console.error('❌ Delete error:', err.message);
+    sendJSON(res, err.statusCode || 500, { error: err.publicMessage || 'Delete failed. Try again.' });
   }
 }
 
 // ─── CORS headers ────────────────────────────────────────────────────────────
-// Comma-separated list of allowed origins; "*" allows any.
-const CORS_ORIGINS = (process.env.CORS_ORIGIN || 'https://www.0xkxx.com,https://0xkxx.com,http://localhost:3000')
+// Comma-separated list of allowed origins; "*" allows any. Local development
+// origins have to be added explicitly through CORS_ORIGIN.
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || 'https://www.0xkxx.com,https://0xkxx.com')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean);
@@ -438,14 +491,34 @@ function setCORSHeaders(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
   } else if (origin && CORS_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
   }
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Max-Age', '600');
+}
+
+// Baseline response headers for everything this service serves.
+function setSecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+}
+
+// Parses the request URL without trusting the Host header; malformed targets
+// such as "//" get a 400 instead of throwing (which would crash the process).
+function parseRequestUrl(req) {
+  try {
+    return new URL(req.url, 'http://localhost');
+  } catch {
+    return null;
+  }
 }
 
 // ─── Shared request handler (web routes) ─────────────────────────────────────
 function handleWebRoutes(req, res, url) {
+  setSecurityHeaders(res);
   setCORSHeaders(req, res);
 
   // Handle CORS preflight
@@ -456,17 +529,24 @@ function handleWebRoutes(req, res, url) {
   }
 
   if (req.method === 'GET' && url.pathname === '/') {
+    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'");
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(getUploadHTML());
     return true;
   }
   if (req.method === 'POST' && url.pathname === '/upload') {
-    handleUpload(req, res);
+    handleUpload(req, res).catch((err) => {
+      console.error('❌ Upload handler error:', err.message);
+      sendJSON(res, 500, { error: 'Upload failed. Try again.' });
+    });
     return true;
   }
-  const deleteMatch = url.pathname.match(/^\/photos\/([A-Za-z0-9_-]+)$/);
+  const deleteMatch = url.pathname.match(/^\/photos\/([A-Za-z0-9_-]{1,128})$/);
   if (req.method === 'DELETE' && deleteMatch) {
-    handleDelete(req, res, deleteMatch[1]);
+    handleDelete(req, res, deleteMatch[1]).catch((err) => {
+      console.error('❌ Delete handler error:', err.message);
+      sendJSON(res, 500, { error: 'Delete failed. Try again.' });
+    });
     return true;
   }
   return false;
@@ -476,7 +556,12 @@ function handleWebRoutes(req, res, url) {
 // still mounts these routes unless ENABLE_WEB_UPLOAD=false.
 function startUploadServer(port = Number(process.env.PORT || 3000)) {
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = parseRequestUrl(req);
+    if (!url) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('bad request');
+      return;
+    }
 
     if (req.method === 'GET' && url.pathname === '/healthz') {
       res.writeHead(200, { 'content-type': 'text/plain' });
@@ -490,6 +575,11 @@ function startUploadServer(port = Number(process.env.PORT || 3000)) {
     res.end('not found');
   });
 
+  // Don't let slow or idle clients hold connections open indefinitely.
+  server.requestTimeout = 120 * 1000;
+  server.headersTimeout = 20 * 1000;
+  server.keepAliveTimeout = 5 * 1000;
+
   server.listen(port, '0.0.0.0', () => {
     console.log(`📤 Upload service listening on port ${port}`);
   });
@@ -500,4 +590,4 @@ if (require.main === module) {
   startUploadServer();
 }
 
-module.exports = { handleWebRoutes, startUploadServer };
+module.exports = { handleWebRoutes, startUploadServer, parseRequestUrl };
