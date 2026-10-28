@@ -342,7 +342,7 @@ async function authorize(req) {
   if (secretMatches(token)) return { via: 'secret' };
 
   try {
-    const decoded = await photoService.admin.auth().verifyIdToken(token);
+    const decoded = await photoService.auth.verifyIdToken(token);
     const email = (decoded.email || '').toLowerCase();
     if (!email || !decoded.email_verified) return null;
     const allowed = await getAllowedEmails();

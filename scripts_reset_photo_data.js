@@ -1,6 +1,7 @@
 require('dotenv').config({ path: '/Users/hongzhikai/Desktop/kxx-profile/photo_uploader_telegram/.env' });
 
-const admin = require('firebase-admin');
+const { initializeApp, getApps, cert } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 const { S3Client, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
 const path = require('path');
 
@@ -9,12 +10,12 @@ const resolvedServiceAccountPath = path.isAbsolute(serviceAccountPath)
   ? serviceAccountPath
   : path.resolve('/Users/hongzhikai/Desktop/kxx-profile/photo_uploader_telegram', serviceAccountPath);
 
-if (!admin.apps.length) {
+if (!getApps().length) {
   const serviceAccount = require(resolvedServiceAccountPath);
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  initializeApp({ credential: cert(serviceAccount) });
 }
 
-const db = admin.firestore();
+const db = getFirestore();
 const bucket = (process.env.R2_BUCKET_NAME || '').split('/').filter(Boolean)[0];
 
 const r2Client = new S3Client({

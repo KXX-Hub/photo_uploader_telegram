@@ -1,7 +1,9 @@
 // Photo pipeline shared by the upload server and the Telegram bot:
 // EXIF reading, format conversion, WebP compression, R2 storage and Firestore.
 // Needs Firebase Admin and R2 credentials only (no Telegram token).
-const admin = require('firebase-admin');
+const { initializeApp, getApps, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const sharp = require('sharp');
 const exifr = require('exifr');
@@ -12,7 +14,7 @@ const path = require('path');
 const os = require('os');
 
 // Initialize Firebase Admin
-if (!admin.apps.length) {
+if (!getApps().length) {
   const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
   const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL;
   const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY;
@@ -34,12 +36,12 @@ if (!admin.apps.length) {
     serviceAccount = require(resolvedServiceAccountPath);
   }
 
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+  initializeApp({
+    credential: cert(serviceAccount)
   });
 }
 
-const db = admin.firestore();
+const db = getFirestore();
 // Enable ignoreUndefinedProperties to prevent Firestore errors
 db.settings({ ignoreUndefinedProperties: true });
 
@@ -528,8 +530,8 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
       thumbnailPath: thumbFilename,
       
       // Timestamp (使用 uploadedAt 以匹配 PhotosPage 的查詢)
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
+      timestamp: FieldValue.serverTimestamp(),
+      uploadedAt: FieldValue.serverTimestamp(),
       
       // Photo info (資訊)
       originalSize: buffer.length,
@@ -614,6 +616,6 @@ async function deletePhoto(photoId) {
 module.exports = {
   processPhotoBuffer,
   deletePhoto,
-  admin,
+  auth: getAuth(),
   db
 };
