@@ -1,5 +1,5 @@
 const admin = require('firebase-admin');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const sharp = require('sharp');
 const exifr = require('exifr');
 const heicConvert = require('heic-convert');
@@ -58,6 +58,20 @@ const R2_THUMBNAILS_PREFIX = (process.env.R2_THUMBNAILS_PREFIX || 'thumbnails').
 
 function buildObjectKey(folder, fileName) {
   return [R2_OBJECT_PREFIX, folder, fileName].filter(Boolean).join('/');
+}
+
+// Turn a public R2 URL back into its object key (for photos saved before
+// storagePath/thumbnailPath were recorded).
+function objectKeyFromUrl(url) {
+  if (!url) return null;
+  if (R2_PUBLIC_URL && url.startsWith(`${R2_PUBLIC_URL}/`)) {
+    return decodeURIComponent(url.slice(R2_PUBLIC_URL.length + 1));
+  }
+  try {
+    return decodeURIComponent(new URL(url).pathname.replace(/^\/+/, '')) || null;
+  } catch {
+    return null;
+  }
 }
 
 function formatApertureToOneDecimal(value) {
@@ -304,7 +318,9 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
       const nameWithoutExt = fileName.replace(/\.[^/.]+$/, '');
       // Sanitize filename: remove special characters, keep only alphanumeric, dash, underscore
       const sanitizedName = nameWithoutExt.replace(/[^a-zA-Z0-9_-]/g, '_');
-      baseFilename = sanitizedName || `photo_${Date.now()}`;
+      // Suffix keeps a re-uploaded file name from overwriting an existing photo in R2.
+      const uniqueSuffix = `${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`;
+      baseFilename = sanitizedName ? `${sanitizedName}_${uniqueSuffix}` : `photo_${Date.now()}`;
     } else {
       // Fallback if no filename
       const timestamp = Date.now();
@@ -422,6 +438,9 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
       url: photoUrl,
       thumbnail: thumbnailUrl,  // PhotosPage 使用 thumbnail
       thumbnailUrl: thumbnailUrl,  // 保留以向後兼容
+      storageProvider: 'r2',
+      storagePath: filename,
+      thumbnailPath: thumbFilename,
       
       // Timestamp (使用 uploadedAt 以匹配 PhotosPage 的查詢)
       timestamp: admin.firestore.FieldValue.serverTimestamp(),
@@ -477,6 +496,37 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
   }
 }
 
+// Delete a photo everywhere: both R2 objects, then the Firestore document.
+async function deletePhoto(photoId) {
+  const ref = db.collection('photos').doc(photoId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    const err = new Error('Photo not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const data = snap.data();
+  const keys = [];
+  if (data.storageProvider !== 'firebase') {
+    const mainKey = data.storagePath || objectKeyFromUrl(data.url);
+    const thumbKey = data.thumbnailPath || objectKeyFromUrl(data.thumbnail || data.thumbnailUrl);
+    if (mainKey) keys.push(mainKey);
+    if (thumbKey && thumbKey !== mainKey) keys.push(thumbKey);
+  }
+
+  await Promise.all(keys.map((Key) => r2Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key }))));
+  await ref.delete();
+  console.log(`🗑️ Deleted photo ${photoId} (R2 objects: ${keys.join(', ') || 'none'})`);
+  return { id: photoId, deletedObjects: keys };
+}
+
+// Optional Telegram allowlist: comma-separated user IDs in TELEGRAM_ALLOWED_USER_IDS.
+const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
+
 // Telegram-specific wrapper: downloads file from Telegram then calls processPhotoBuffer
 async function processPhoto(photo, caption, ctx) {
   const file = await ctx.telegram.getFile(photo.file_id);
@@ -493,8 +543,17 @@ function initialize(bot) {
     const fromId = ctx.from?.id || 'unknown';
     const chatId = ctx.chat?.id || 'unknown';
     console.log(`📩 Update received: type=${updateType} from=${fromId} chat=${chatId}`);
+    if (TELEGRAM_ALLOWED_USER_IDS.length && !TELEGRAM_ALLOWED_USER_IDS.includes(String(ctx.from?.id))) {
+      console.warn(`🚫 Ignoring update from user ${fromId} (not in TELEGRAM_ALLOWED_USER_IDS)`);
+      if (ctx.chat) await ctx.reply('🚫 This bot is private.').catch(() => {});
+      return;
+    }
     return next();
   });
+
+  if (!TELEGRAM_ALLOWED_USER_IDS.length) {
+    console.warn('⚠️ TELEGRAM_ALLOWED_USER_IDS is not set: anyone who finds this bot can upload photos.');
+  }
 
   async function safeReply(ctx, text) {
     try {
@@ -571,5 +630,8 @@ function initialize(bot) {
 
 module.exports = {
   initialize,
-  processPhotoBuffer
+  processPhotoBuffer,
+  deletePhoto,
+  admin,
+  db
 };

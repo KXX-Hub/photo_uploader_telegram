@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const http = require('http');
 const { URL } = require('url');
+const crypto = require('crypto');
 const Busboy = require('busboy');
 const telegramBot = require('./telegram-bot');
 
@@ -292,17 +293,64 @@ function getUploadHTML() {
 </html>`;
 }
 
+// ─── Auth ────────────────────────────────────────────────────────────────────
+// Accepts either the UPLOAD_SECRET (built-in upload page / scripts) or a Firebase
+// ID token from the website dashboard whose email is on the dashboard allowlist
+// (Firestore settings/dashboard_auth, plus optional ADMIN_EMAILS env).
+// Fails closed: with no secret and no allowlist, nothing is authorized.
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+
+function secretMatches(provided) {
+  if (!UPLOAD_SECRET || !provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(UPLOAD_SECRET);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function getAllowedEmails() {
+  const allowed = new Set(ADMIN_EMAILS);
+  try {
+    const snap = await telegramBot.db.collection('settings').doc('dashboard_auth').get();
+    const data = snap.exists ? snap.data() : {};
+    (Array.isArray(data.allowedEmails) ? data.allowedEmails : []).forEach((e) => allowed.add(String(e).trim().toLowerCase()));
+    if (data.allowedEmail) allowed.add(String(data.allowedEmail).trim().toLowerCase());
+  } catch (err) {
+    console.error('❌ Could not read dashboard allowlist:', err.message);
+  }
+  return allowed;
+}
+
+async function authorize(req) {
+  const header = req.headers['authorization'] || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return null;
+  if (secretMatches(token)) return { via: 'secret' };
+
+  try {
+    const decoded = await telegramBot.admin.auth().verifyIdToken(token);
+    const email = (decoded.email || '').toLowerCase();
+    if (!email || !decoded.email_verified) return null;
+    const allowed = await getAllowedEmails();
+    return allowed.has(email) ? { via: 'firebase', email } : null;
+  } catch {
+    return null;
+  }
+}
+
+function sendJSON(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
 // ─── Web Upload: POST /upload handler ────────────────────────────────────────
-function handleUpload(req, res) {
-  // Auth check
-  if (UPLOAD_SECRET) {
-    const auth = req.headers['authorization'] || '';
-    const provided = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (provided !== UPLOAD_SECRET) {
-      res.writeHead(401, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Unauthorized' }));
-      return;
-    }
+async function handleUpload(req, res) {
+  if (!(await authorize(req))) {
+    req.resume();
+    sendJSON(res, 401, { error: 'Unauthorized' });
+    return;
   }
 
   let busboy;
@@ -360,18 +408,43 @@ function handleUpload(req, res) {
   req.pipe(busboy);
 }
 
-// ─── CORS headers ────────────────────────────────────────────────────────────
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+// ─── Web: DELETE /photos/:id handler ─────────────────────────────────────────
+async function handleDelete(req, res, photoId) {
+  if (!(await authorize(req))) {
+    sendJSON(res, 401, { error: 'Unauthorized' });
+    return;
+  }
+  try {
+    const result = await telegramBot.deletePhoto(photoId);
+    sendJSON(res, 200, { success: true, ...result });
+  } catch (err) {
+    console.error('❌ Delete error:', err);
+    sendJSON(res, err.statusCode || 500, { error: err.message });
+  }
+}
 
-function setCORSHeaders(res) {
-  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+// ─── CORS headers ────────────────────────────────────────────────────────────
+// Comma-separated list of allowed origins; "*" allows any.
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || 'https://www.0xkxx.com,https://0xkxx.com,http://localhost:3000')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+function setCORSHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (CORS_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && CORS_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
 }
 
 // ─── Shared request handler (web routes) ─────────────────────────────────────
 function handleWebRoutes(req, res, url) {
-  setCORSHeaders(res);
+  setCORSHeaders(req, res);
 
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
@@ -387,6 +460,11 @@ function handleWebRoutes(req, res, url) {
   }
   if (req.method === 'POST' && url.pathname === '/upload') {
     handleUpload(req, res);
+    return true;
+  }
+  const deleteMatch = url.pathname.match(/^\/photos\/([A-Za-z0-9_-]+)$/);
+  if (req.method === 'DELETE' && deleteMatch) {
+    handleDelete(req, res, deleteMatch[1]);
     return true;
   }
   return false;
