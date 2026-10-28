@@ -88,26 +88,56 @@ function coarseGps(lat, lon) {
   return { latitude: Math.round(la * 1000) / 1000, longitude: Math.round(lo * 1000) / 1000 };
 }
 
-// Decodes HEIC/HEIF with libheif when sharp's build can't. libheif parses the
-// container first and reports the primary image's real output size (for tiled
-// images, the full grid), so oversized images are refused before any pixels
-// are decoded; the decoded RGBA then goes through the same limited sharp path.
+// Largest image any item in a HEIF container declares: every image item
+// (primary, tiles, thumbnails, alpha/depth) has an 'ispe' property — 4-byte
+// size, 'ispe', 4 bytes of version/flags, then width and height. Used as a
+// container-wide budget check alongside libheif's own primary-image size.
+function heifMaxDeclaredPixels(buffer) {
+  let max = 0;
+  for (let i = buffer.indexOf('ispe'); i !== -1; i = buffer.indexOf('ispe', i + 4)) {
+    if (i < 4 || i + 16 > buffer.length) continue;
+    max = Math.max(max, buffer.readUInt32BE(i + 8) * buffer.readUInt32BE(i + 12));
+  }
+  return max;
+}
+
+// Decodes HEIC/HEIF with libheif when sharp's build can't. Before any pixels
+// are decoded, both the largest size declared anywhere in the container and
+// libheif's own output size for the primary image (for tiled images, the full
+// grid) must be within the pixel budget. The decoded RGBA then goes through
+// the same limited sharp path, and libheif's WASM-side images are always freed.
 async function decodeHeic(buffer) {
-  const images = new libheif.HeifDecoder().decode(buffer);
-  if (!images.length) throw userError('No image found in this HEIC file.');
-  const image = images[0];
-  const width = image.get_width();
-  const height = image.get_height();
-  if (!width || !height || width * height > MAX_INPUT_PIXELS) {
+  if (heifMaxDeclaredPixels(buffer) > MAX_INPUT_PIXELS) {
     throw userError('This image is too large (over 50 megapixels).');
   }
-  const pixels = await new Promise((resolve, reject) => {
-    image.display({ data: new Uint8ClampedArray(width * height * 4), width, height }, (result) => {
-      if (!result) reject(userError('Could not read this HEIC file. It may be damaged.'));
-      else resolve(Buffer.from(result.data.buffer));
+  // HeifDecoder only frees its libheif context on its next decode(), so free
+  // it here ourselves; otherwise every upload leaks a copy of the file.
+  const decoder = new libheif.HeifDecoder();
+  const images = decoder.decode(buffer);
+  try {
+    if (!images.length) throw userError('No image found in this HEIC file.');
+    const image = images[0];
+    const width = image.get_width();
+    const height = image.get_height();
+    if (!width || !height || width * height > MAX_INPUT_PIXELS) {
+      throw userError('This image is too large (over 50 megapixels).');
+    }
+    const pixels = await new Promise((resolve, reject) => {
+      image.display({ data: new Uint8ClampedArray(width * height * 4), width, height }, (result) => {
+        if (!result) reject(userError('Could not read this HEIC file. It may be damaged.'));
+        else resolve(Buffer.from(result.data.buffer));
+      });
     });
-  });
-  return sharp(pixels, { ...SHARP_OPTS, raw: { width, height, channels: 4 } });
+    return sharp(pixels, { ...SHARP_OPTS, raw: { width, height, channels: 4 } });
+  } finally {
+    images.forEach((img) => {
+      try { img.free(); } catch { /* already released */ }
+    });
+    if (decoder.decoder) {
+      libheif.heif_context_free(decoder.decoder);
+      decoder.decoder = null;
+    }
+  }
 }
 
 const clip = (value, max = 100) => String(value || '').trim().slice(0, max);
