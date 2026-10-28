@@ -110,7 +110,17 @@ function heifMaxDeclaredPixels(buffer) {
 // same limited sharp path as everything else.
 const HEIC_TIMEOUT_MS = 60 * 1000;
 
-async function decodeHeic(buffer) {
+// Uploads from the web and from Telegram share one queue, so only one HEIC
+// worker (and one libheif heap) exists at a time.
+let heicQueue = Promise.resolve();
+
+function decodeHeic(buffer) {
+  const run = heicQueue.then(() => decodeHeicNow(buffer));
+  heicQueue = run.catch(() => {});
+  return run;
+}
+
+async function decodeHeicNow(buffer) {
   if (heifMaxDeclaredPixels(buffer) > MAX_INPUT_PIXELS) {
     throw userError('This image is too large (over 50 megapixels).');
   }
