@@ -10,6 +10,21 @@ const ENABLE_WEB_UPLOAD = process.env.ENABLE_WEB_UPLOAD !== 'false';
 const handleWebRoutes = ENABLE_WEB_UPLOAD
   ? require('./upload-server').handleWebRoutes
   : () => false;
+const { parseRequestUrl } = require('./upload-server');
+const crypto = require('crypto');
+
+const sameSecret = (provided, expected) => {
+  const a = Buffer.from(String(provided || ''));
+  const b = Buffer.from(String(expected || ''));
+  return a.length === b.length && b.length > 0 && crypto.timingSafeEqual(a, b);
+};
+
+// A malformed request target ("//", a bad Host) gets a 400 instead of
+// throwing inside the handler and taking the whole process down.
+const badRequest = (res) => {
+  res.writeHead(400, { 'content-type': 'text/plain' });
+  res.end('bad request');
+};
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -66,7 +81,8 @@ async function start() {
       const webhookHandler = bot.webhookCallback(webhookPath);
 
       const server = http.createServer((req, res) => {
-        const url = new URL(req.url, `http://${req.headers.host}`);
+        const url = parseRequestUrl(req);
+        if (!url) return badRequest(res);
 
         if (req.method === 'GET' && url.pathname === '/healthz') {
           res.writeHead(200, { 'content-type': 'text/plain' });
@@ -77,7 +93,7 @@ async function start() {
         if (req.method === 'POST' && url.pathname === webhookPath) {
           if (webhookSecret) {
             const headerSecret = req.headers['x-telegram-bot-api-secret-token'];
-            if (headerSecret !== webhookSecret) {
+            if (!sameSecret(headerSecret, webhookSecret)) {
               res.writeHead(401, { 'content-type': 'text/plain' });
               res.end('unauthorized');
               return;
@@ -104,7 +120,8 @@ async function start() {
 
     // Polling mode — start a standalone HTTP server just for web upload
     const server = http.createServer((req, res) => {
-      const url = new URL(req.url, `http://${req.headers.host}`);
+      const url = parseRequestUrl(req);
+      if (!url) return badRequest(res);
 
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'content-type': 'text/plain' });

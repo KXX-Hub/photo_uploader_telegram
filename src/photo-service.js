@@ -63,6 +63,34 @@ function buildObjectKey(folder, fileName) {
   return [R2_OBJECT_PREFIX, folder, fileName].filter(Boolean).join('/');
 }
 
+// Decoding limits. A small file can describe an enormous image (a
+// "decompression bomb"); sharp refuses anything over ~50 megapixels, and every
+// format is downscaled to the 2000px output size as soon as it's decoded.
+const MAX_INPUT_PIXELS = 50 * 1000 * 1000;
+const MAX_EDGE = 2000;
+const SHARP_OPTS = { limitInputPixels: MAX_INPUT_PIXELS };
+const decode = (input) => sharp(input, SHARP_OPTS);
+
+// Errors whose message is safe to show to the person uploading.
+function userError(message, statusCode = 400) {
+  const err = new Error(message);
+  err.publicMessage = message;
+  err.statusCode = statusCode;
+  return err;
+}
+
+// Coordinates are stored at ~100 m precision (3 decimals): photo documents are
+// publicly readable, and an exact position could reveal a home address.
+function coarseGps(lat, lon) {
+  const la = Number(lat);
+  const lo = Number(lon);
+  if (!Number.isFinite(la) || !Number.isFinite(lo) || Math.abs(la) > 90 || Math.abs(lo) > 180) return null;
+  return { latitude: Math.round(la * 1000) / 1000, longitude: Math.round(lo * 1000) / 1000 };
+}
+
+const clip = (value, max = 100) => String(value || '').trim().slice(0, max);
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/;
+
 // Turn a public R2 URL back into its object key (for photos saved before
 // storagePath/thumbnailPath were recorded).
 function objectKeyFromUrl(url) {
@@ -142,7 +170,7 @@ function parseLocationFromText(text) {
   // Try to extract location from caption
   const locationMatch = text.match(/📍\s*(.+)/i) || text.match(/location[:\s]+(.+)/i);
   if (locationMatch) {
-    return locationMatch[1].trim();
+    return locationMatch[1].trim().slice(0, 100);
   }
   return null;
 }
@@ -203,14 +231,21 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
     if (isHeic) {
       try {
         // Try sharp first with auto-orientation
-        processedBuffer = await sharp(buffer)
+        processedBuffer = await decode(buffer)
           .rotate() // Auto-rotate based on EXIF orientation
+          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
           .webp({ quality: 90 })
           .toBuffer();
         finalMimeType = 'image/webp';
       } catch (error) {
         console.log('Sharp failed, trying heic-convert:', error.message);
-        // Fallback to heic-convert
+        // Fallback to heic-convert, which has no size limit of its own: only
+        // run it when EXIF says the image is within the pixel budget.
+        const w = Number(exifData.ExifImageWidth || exifData.ImageWidth || 0);
+        const h = Number(exifData.ExifImageHeight || exifData.ImageHeight || 0);
+        if (!w || !h || w * h > MAX_INPUT_PIXELS) {
+          throw userError('This HEIC file is too large or unreadable. Export it as JPEG and try again.');
+        }
         try {
           const outputBuffer = await heicConvert({
             buffer: buffer,
@@ -218,72 +253,69 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
             quality: 0.9
           });
           // Convert JPEG to WebP with auto-orientation
-          processedBuffer = await sharp(outputBuffer)
+          processedBuffer = await decode(outputBuffer)
             .rotate() // Auto-rotate based on EXIF orientation
+          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
             .webp({ quality: 90 })
             .toBuffer();
           finalMimeType = 'image/webp';
         } catch (convertError) {
           console.error('HEIC conversion error:', convertError.message);
-          throw new Error('Failed to process HEIC file');
+          throw userError('Could not read this HEIC file. It may be damaged or too large.');
         }
       }
     } else if (isRaw || isTiff) {
       // Process RAW and TIFF files
       try {
-        processedBuffer = await sharp(buffer)
+        processedBuffer = await decode(buffer)
           .rotate() // Auto-rotate based on EXIF orientation
+          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
           .webp({ quality: 90 })
           .toBuffer();
         finalMimeType = 'image/webp';
       } catch (error) {
         console.error('RAW/TIFF processing error:', error.message);
-        throw new Error('Failed to process RAW/TIFF file');
+        throw userError('Could not read this RAW/TIFF file. It may be damaged or too large.');
       }
     } else if (isPng) {
       // Process PNG files
       try {
-        processedBuffer = await sharp(buffer)
+        processedBuffer = await decode(buffer)
           .rotate() // Auto-rotate based on EXIF orientation
+          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
           .webp({ quality: 90 })
           .toBuffer();
         finalMimeType = 'image/webp';
       } catch (error) {
         console.error('PNG processing error:', error.message);
-        throw new Error('Failed to process PNG file');
+        throw userError('Could not read this PNG file. It may be damaged or too large.');
       }
     } else if (!isWebP && !isJpeg) {
       // Convert other formats to WebP
       try {
-        processedBuffer = await sharp(buffer)
+        processedBuffer = await decode(buffer)
           .rotate() // Auto-rotate based on EXIF orientation
+          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
           .webp({ quality: 90 })
           .toBuffer();
         finalMimeType = 'image/webp';
       } catch (error) {
         console.error('Format conversion error:', error.message);
-        throw new Error('Failed to process image file');
+        throw userError('Could not read this image file. It may be damaged or too large.');
       }
     } else {
       // For JPEG and WebP, also apply auto-orientation
-      processedBuffer = await sharp(buffer)
+      processedBuffer = await decode(buffer)
         .rotate() // Auto-rotate based on EXIF orientation
+          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
         .toBuffer();
     }
     mark('normalize');
 
-    // Extract GPS coordinates
+    // Extract GPS coordinates (stored coarse; see coarseGps)
     let gps = null;
     if (exifData.latitude && exifData.longitude) {
-      gps = {
-        latitude: exifData.latitude,
-        longitude: exifData.longitude
-      };
-    } else if (exifData.GPSLatitude && exifData.GPSLongitude) {
-      gps = {
-        latitude: exifData.GPSLatitude,
-        longitude: exifData.GPSLongitude
-      };
+      gps = coarseGps(exifData.latitude, exifData.longitude);
     }
 
     // Get location from GPS or caption
@@ -300,14 +332,14 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
 
     // Compress and thumbnail in parallel to reduce response latency.
     const [compressedBuffer, thumbnailBuffer] = await Promise.all([
-      sharp(processedBuffer)
+      decode(processedBuffer)
         .resize(2000, 2000, {
           fit: 'inside',
           withoutEnlargement: true
         })
         .webp({ quality: 85, effort: 4 })
         .toBuffer(),
-      sharp(processedBuffer)
+      decode(processedBuffer)
         .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
         .webp({ quality: 82, effort: 4 })
         .toBuffer()
@@ -320,7 +352,7 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
       // Use original filename, remove extension and add .webp
       const nameWithoutExt = fileName.replace(/\.[^/.]+$/, '');
       // Sanitize filename: remove special characters, keep only alphanumeric, dash, underscore
-      const sanitizedName = nameWithoutExt.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const sanitizedName = nameWithoutExt.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
       // Suffix keeps a re-uploaded file name from overwriting an existing photo in R2.
       const uniqueSuffix = `${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`;
       baseFilename = sanitizedName ? `${sanitizedName}_${uniqueSuffix}` : `photo_${Date.now()}`;
@@ -362,7 +394,7 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
       console.log('✅ Photos uploaded to R2 successfully');
     } catch (uploadError) {
       console.error('❌ R2 Upload Error:', uploadError);
-      throw new Error(`Failed to upload to R2: ${uploadError.message}`);
+      throw userError('Could not store the photo. Try again in a minute.', 502);
     }
     mark('r2-upload');
 
@@ -418,20 +450,19 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
     }
 
     // Apply client-provided EXIF overrides (fallback for formats where buffer EXIF is unavailable)
-    if (!device && exifOverrides.device) device = exifOverrides.device;
-    if (!dateStr && exifOverrides.date) dateStr = exifOverrides.date;
-    if (!settings.aperture && exifOverrides.aperture) settings.aperture = exifOverrides.aperture;
-    if (!settings.shutter && exifOverrides.shutter) settings.shutter = exifOverrides.shutter;
-    if (!settings.iso && exifOverrides.iso) settings.iso = `ISO ${exifOverrides.iso}`;
-    if (!settings.focalLength && exifOverrides.focalLength) settings.focalLength = exifOverrides.focalLength;
+    // Overrides are untrusted text: length-capped and format-checked.
+    if (!device && exifOverrides.device) device = clip(exifOverrides.device, 80);
+    if (!dateStr && DATE_PATTERN.test(clip(exifOverrides.date, 19))) dateStr = clip(exifOverrides.date, 19);
+    if (!settings.aperture && exifOverrides.aperture) settings.aperture = clip(exifOverrides.aperture, 12);
+    if (!settings.shutter && exifOverrides.shutter) settings.shutter = clip(exifOverrides.shutter, 12);
+    if (!settings.iso && /^\d{1,6}$/.test(clip(exifOverrides.iso, 6))) settings.iso = `ISO ${clip(exifOverrides.iso, 6)}`;
+    if (!settings.focalLength && exifOverrides.focalLength) settings.focalLength = clip(exifOverrides.focalLength, 12);
     if (!gps && exifOverrides.latitude != null && exifOverrides.longitude != null) {
       const lat = parseFloat(exifOverrides.latitude);
       const lon = parseFloat(exifOverrides.longitude);
-      if (!isNaN(lat) && !isNaN(lon)) {
-        gps = { latitude: lat, longitude: lon };
-        if (!location && ENABLE_REVERSE_GEOCODE) {
-          location = await reverseGeocode(lat, lon);
-        }
+      gps = coarseGps(lat, lon);
+      if (gps && !location && ENABLE_REVERSE_GEOCODE) {
+        location = await reverseGeocode(gps.latitude, gps.longitude);
       }
     }
 
@@ -505,6 +536,7 @@ async function deletePhoto(photoId) {
   const snap = await ref.get();
   if (!snap.exists) {
     const err = new Error('Photo not found');
+    err.publicMessage = 'Photo not found';
     err.statusCode = 404;
     throw err;
   }
@@ -514,8 +546,12 @@ async function deletePhoto(photoId) {
   if (data.storageProvider !== 'firebase') {
     const mainKey = data.storagePath || objectKeyFromUrl(data.url);
     const thumbKey = data.thumbnailPath || objectKeyFromUrl(data.thumbnail || data.thumbnailUrl);
-    if (mainKey) keys.push(mainKey);
-    if (thumbKey && thumbKey !== mainKey) keys.push(thumbKey);
+    // Only delete objects this service created, so a tampered document can't
+    // point a delete at anything else in the bucket.
+    const ownPrefixes = [`${buildObjectKey(R2_ORIGINALS_PREFIX, '')}/`, `${buildObjectKey(R2_THUMBNAILS_PREFIX, '')}/`];
+    const isOwnKey = (key) => typeof key === 'string' && !key.includes('..') && ownPrefixes.some((prefix) => key.startsWith(prefix));
+    if (isOwnKey(mainKey)) keys.push(mainKey);
+    if (isOwnKey(thumbKey) && thumbKey !== mainKey) keys.push(thumbKey);
   }
 
   await Promise.all(keys.map((Key) => r2Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key }))));
