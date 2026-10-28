@@ -5,7 +5,7 @@ const admin = require('firebase-admin');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const sharp = require('sharp');
 const exifr = require('exifr');
-const heicConvert = require('heic-convert');
+const libheif = require('libheif-js');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -88,19 +88,26 @@ function coarseGps(lat, lon) {
   return { latitude: Math.round(la * 1000) / 1000, longitude: Math.round(lo * 1000) / 1000 };
 }
 
-// Largest image size declared in a HEIF/HEIC container. Every image item has
-// an 'ispe' (image spatial extents) property: 4-byte size, 'ispe', 4 bytes of
-// version/flags, then width and height. These are what the decoder uses, so
-// unlike EXIF they can't understate the real size. Returns 0 if none found.
-function heifMaxPixels(buffer) {
-  let max = 0;
-  for (let i = buffer.indexOf('ispe'); i !== -1; i = buffer.indexOf('ispe', i + 4)) {
-    if (i < 4 || i + 16 > buffer.length) continue;
-    const width = buffer.readUInt32BE(i + 8);
-    const height = buffer.readUInt32BE(i + 12);
-    max = Math.max(max, width * height);
+// Decodes HEIC/HEIF with libheif when sharp's build can't. libheif parses the
+// container first and reports the primary image's real output size (for tiled
+// images, the full grid), so oversized images are refused before any pixels
+// are decoded; the decoded RGBA then goes through the same limited sharp path.
+async function decodeHeic(buffer) {
+  const images = new libheif.HeifDecoder().decode(buffer);
+  if (!images.length) throw userError('No image found in this HEIC file.');
+  const image = images[0];
+  const width = image.get_width();
+  const height = image.get_height();
+  if (!width || !height || width * height > MAX_INPUT_PIXELS) {
+    throw userError('This image is too large (over 50 megapixels).');
   }
-  return max;
+  const pixels = await new Promise((resolve, reject) => {
+    image.display({ data: new Uint8ClampedArray(width * height * 4), width, height }, (result) => {
+      if (!result) reject(userError('Could not read this HEIC file. It may be damaged.'));
+      else resolve(Buffer.from(result.data.buffer));
+    });
+  });
+  return sharp(pixels, { ...SHARP_OPTS, raw: { width, height, channels: 4 } });
 }
 
 const clip = (value, max = 100) => String(value || '').trim().slice(0, max);
@@ -258,27 +265,17 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
           throw userError('This image is too large (over 50 megapixels).');
         }
         console.log('Sharp failed, trying heic-convert:', error.message);
-        // Fallback to heic-convert, which has no size limit of its own: only
-        // run it when the container's own declared size is within budget.
-        const pixels = heifMaxPixels(buffer);
-        if (!pixels || pixels > MAX_INPUT_PIXELS) {
-          throw userError('This HEIC file is too large or unreadable. Export it as JPEG and try again.');
-        }
+        // Fallback: libheif, size-checked from its own header parse.
         try {
-          const outputBuffer = await heicConvert({
-            buffer: buffer,
-            format: 'JPEG',
-            quality: 0.9
-          });
-          // Convert JPEG to WebP with auto-orientation
-          processedBuffer = await decode(outputBuffer)
-            .rotate() // Auto-rotate based on EXIF orientation
-          .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
+          // libheif already applies the image's rotation/mirroring.
+          processedBuffer = await (await decodeHeic(buffer))
+            .resize(MAX_EDGE, MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
             .webp({ quality: 90 })
             .toBuffer();
           finalMimeType = 'image/webp';
         } catch (convertError) {
           console.error('HEIC conversion error:', convertError.message);
+          if (convertError.publicMessage) throw convertError;
           throw userError('Could not read this HEIC file. It may be damaged or too large.');
         }
       }
