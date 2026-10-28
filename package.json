@@ -1,11 +1,13 @@
 {
   "name": "kxx-telegram-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for photo upload and management",
+  "description": "Photo upload service for the kxx-profile dashboard, plus an optional Telegram bot",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "start:upload": "node src/upload-server.js",
+    "dev": "nodemon src/index.js",
+    "dev:upload": "nodemon src/upload-server.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.500.0",

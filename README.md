@@ -1,6 +1,15 @@
-# KXX Telegram Photo Bot
+# KXX Photo Uploader
 
-Telegram bot for uploading photos to the gallery with EXIF data extraction and HEIC support.
+Photo pipeline for the kxx-profile gallery: EXIF extraction, HEIC/RAW conversion,
+WebP compression, Cloudflare R2 storage and Firestore. It runs as two independent
+entry points that share `src/photo-service.js`:
+
+| Service | Start command | Needs Telegram? | What it serves |
+| --- | --- | --- | --- |
+| Upload service | `npm run start:upload` | No | `POST /upload`, `DELETE /photos/:id`, `GET /healthz`, upload page at `GET /` (used by the website dashboard) |
+| Telegram bot | `npm start` | Yes | Photos sent to the bot, plus the same web routes unless `ENABLE_WEB_UPLOAD=false` |
+
+The website dashboard only needs the upload service.
 
 ## Setup
 
@@ -21,7 +30,26 @@ cp .env.example .env
 npm start
 ```
 
-## Deploy To Koyeb (Webhook Mode)
+## Deploy the upload service to Koyeb (no Telegram)
+
+1. Create a new Koyeb Web Service from `KXX-Hub/photo_uploader_telegram`.
+   - Start command: `npm run start:upload`
+   - Exposed port: `3000` (or set `PORT`)
+   - Health check: `GET /healthz`
+2. Set environment variables:
+   - Firebase Admin: `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`
+     (or `FIREBASE_SERVICE_ACCOUNT_PATH`)
+   - R2: `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_URL`
+     (optional `R2_OBJECT_PREFIX`, `R2_ORIGINALS_PREFIX`, `R2_THUMBNAILS_PREFIX`)
+   - Access: allowed Google accounts come from Firestore `settings/dashboard_auth`;
+     optional `ADMIN_EMAILS`, `UPLOAD_SECRET` (for the page at `GET /`), `CORS_ORIGIN`
+   - `TELEGRAM_BOT_TOKEN` is **not** needed.
+3. Point the website at it: set `REACT_APP_UPLOAD_URL=https://<upload-service-domain>` in
+   kxx-profile's `.env` (or Vercel env) and redeploy the site.
+4. When you no longer want the Telegram bot, pause or delete the bot service on Koyeb.
+   If you keep it, set `ENABLE_WEB_UPLOAD=false` on it so only one service handles uploads.
+
+## Deploy the Telegram bot to Koyeb (Webhook Mode)
 
 This bot supports two modes:
 - Polling mode: default when `WEBHOOK_DOMAIN` is empty
@@ -96,3 +124,6 @@ Then send a message/photo to the bot and confirm it is processed.
 - `R2_SECRET_ACCESS_KEY`: R2 secret access key
 - `R2_BUCKET_NAME`: R2 bucket name
 - `R2_PUBLIC_URL`: Public URL for R2 bucket
+- `TELEGRAM_ALLOWED_USER_IDS`: Comma-separated Telegram user IDs allowed to use the bot
+- `ENABLE_WEB_UPLOAD`: Set to `false` on the bot when the upload service runs separately
+- `ADMIN_EMAILS`, `UPLOAD_SECRET`, `CORS_ORIGIN`: Upload service access (see above)
