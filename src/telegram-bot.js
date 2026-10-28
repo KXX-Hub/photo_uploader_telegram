@@ -474,7 +474,7 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
 
     // Step 4: Save to Firestore (存到 Firestore)
     console.log('💾 Saving to Firestore...');
-    await db.collection('photos').add(photoData);
+    const docRef = await db.collection('photos').add(photoData);
     console.log('✅ Saved to Firestore');
     mark('firestore-write');
 
@@ -489,7 +489,7 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
       `💡 Tip: To preserve EXIF data, send photos as files instead of images.`;
     mark('total');
 
-    return message;
+    return { message, id: docRef.id };
   } catch (error) {
     console.error('Photo processing error:', error);
     throw error;
@@ -574,7 +574,7 @@ function initialize(bot) {
       
       console.log('📸 Received photo from user:', ctx.from.id);
       await safeReply(ctx, '📸 Processing...');
-      const message = await processPhoto(photo, caption, ctx);
+      const { message } = await processPhoto(photo, caption, ctx);
       await safeReply(ctx, message);
     } catch (error) {
       console.error('❌ Error processing photo:', error);
@@ -600,7 +600,7 @@ function initialize(bot) {
       
       if (isImageFile) {
         await safeReply(ctx, '📸 Processing...');
-        const message = await processPhoto(doc, ctx.message.caption || '', ctx);
+        const { message } = await processPhoto(doc, ctx.message.caption || '', ctx);
         await safeReply(ctx, message);
       } else {
         await safeReply(ctx, '❌ Unsupported file format. Please send an image file.');

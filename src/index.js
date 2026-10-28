@@ -389,9 +389,8 @@ async function handleUpload(req, res) {
       return;
     }
     try {
-      const message = await telegramBot.processPhotoBuffer(fileBuffer, fileName, mimeType, caption, exifOverrides);
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message }));
+      const { message, id } = await telegramBot.processPhotoBuffer(fileBuffer, fileName, mimeType, caption, exifOverrides);
+      sendJSON(res, 200, { success: true, message, id });
     } catch (err) {
       console.error('❌ Web upload error:', err);
       res.writeHead(500, { 'content-type': 'application/json' });
