@@ -134,6 +134,7 @@ function getUploadHTML() {
     }
     .result-ok { background: #0d2010; border: 1px solid #1a4020; color: #7ed99a; }
     .result-err { background: #1f0d0d; border: 1px solid #3d1515; color: #e07070; }
+    .result-message { white-space: pre-line; }
     .status-text { color: #888; font-size: 0.82rem; margin-top: 10px; text-align: center; }
   </style>
 </head>
@@ -208,15 +209,34 @@ function getUploadHTML() {
     renderFileList();
   }
 
+  // File names and server messages (which echo EXIF device/location text) are
+  // untrusted, so they're always inserted as text, never as HTML.
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text != null) node.textContent = text;
+    return node;
+  }
+
   function renderFileList() {
-    fileList.innerHTML = files.map((f, i) => \`
-      <div class="file-item">
-        <span class="file-item-name">\${f.name}</span>
-        <span class="file-item-size">\${(f.size / 1024 / 1024).toFixed(1)} MB</span>
-        <span class="file-item-remove" onclick="removeFile(\${i})">✕</span>
-      </div>
-    \`).join('');
+    fileList.replaceChildren(...files.map((f, i) => {
+      const item = el('div', 'file-item');
+      const remove = el('span', 'file-item-remove', '✕');
+      remove.addEventListener('click', () => removeFile(i));
+      item.append(
+        el('span', 'file-item-name', f.name),
+        el('span', 'file-item-size', \`\${(f.size / 1024 / 1024).toFixed(1)} MB\`),
+        remove
+      );
+      return item;
+    }));
     uploadBtn.disabled = files.length === 0;
+  }
+
+  function addResult(ok, name, message) {
+    const item = el('div', \`result-item \${ok ? 'result-ok' : 'result-err'}\`);
+    item.append(el('strong', null, name), el('div', 'result-message', message));
+    results.append(item);
   }
 
   function removeFile(i) {
@@ -233,7 +253,7 @@ function getUploadHTML() {
     ` : ''}
 
     uploadBtn.disabled = true;
-    results.innerHTML = '';
+    results.replaceChildren();
     progressWrap.style.display = 'block';
     progressBar.style.width = '0%';
 
@@ -254,15 +274,12 @@ function getUploadHTML() {
         });
         const data = await res.json();
         if (res.ok && data.success) {
-          results.insertAdjacentHTML('beforeend',
-            \`<div class="result-item result-ok"><strong>\${file.name}</strong><br>\${data.message.replace(/\\n/g, '<br>')}</div>\`);
+          addResult(true, file.name, data.message);
         } else {
-          results.insertAdjacentHTML('beforeend',
-            \`<div class="result-item result-err"><strong>\${file.name}</strong><br>\${data.error || 'Upload failed'}</div>\`);
+          addResult(false, file.name, data.error || 'Upload failed');
         }
       } catch (err) {
-        results.insertAdjacentHTML('beforeend',
-          \`<div class="result-item result-err"><strong>\${file.name}</strong><br>Network error: \${err.message}</div>\`);
+        addResult(false, file.name, 'Network error: ' + err.message);
       }
 
       done++;
