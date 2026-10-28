@@ -5,7 +5,7 @@ const admin = require('firebase-admin');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const sharp = require('sharp');
 const exifr = require('exifr');
-const libheif = require('libheif-js');
+const { Worker } = require('worker_threads');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -101,42 +101,38 @@ function heifMaxDeclaredPixels(buffer) {
   return max;
 }
 
-// Decodes HEIC/HEIF with libheif when sharp's build can't. Before any pixels
-// are decoded, both the largest size declared anywhere in the container and
-// libheif's own output size for the primary image (for tiled images, the full
-// grid) must be within the pixel budget. The decoded RGBA then goes through
-// the same limited sharp path, and libheif's WASM-side images are always freed.
+// Decodes HEIC/HEIF with libheif when sharp's build can't. The largest size
+// declared anywhere in the container must be within the pixel budget before
+// any decoding starts; the worker then checks libheif's own output size for
+// the primary image (for tiled images, the full grid) before decoding pixels.
+// Each file gets its own worker, which is always ended afterwards, so libheif's
+// WASM memory never outlives the upload. The RGBA result then goes through the
+// same limited sharp path as everything else.
+const HEIC_TIMEOUT_MS = 60 * 1000;
+
 async function decodeHeic(buffer) {
   if (heifMaxDeclaredPixels(buffer) > MAX_INPUT_PIXELS) {
     throw userError('This image is too large (over 50 megapixels).');
   }
-  // HeifDecoder only frees its libheif context on its next decode(), so free
-  // it here ourselves; otherwise every upload leaks a copy of the file.
-  const decoder = new libheif.HeifDecoder();
-  const images = decoder.decode(buffer);
+  const worker = new Worker(path.join(__dirname, 'heic-worker.js'), {
+    workerData: { buffer, maxPixels: MAX_INPUT_PIXELS }
+  });
+  let timer;
   try {
-    if (!images.length) throw userError('No image found in this HEIC file.');
-    const image = images[0];
-    const width = image.get_width();
-    const height = image.get_height();
-    if (!width || !height || width * height > MAX_INPUT_PIXELS) {
-      throw userError('This image is too large (over 50 megapixels).');
-    }
-    const pixels = await new Promise((resolve, reject) => {
-      image.display({ data: new Uint8ClampedArray(width * height * 4), width, height }, (result) => {
-        if (!result) reject(userError('Could not read this HEIC file. It may be damaged.'));
-        else resolve(Buffer.from(result.data.buffer));
-      });
+    const result = await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('HEIC decode timed out')), HEIC_TIMEOUT_MS);
+      worker.once('message', resolve);
+      worker.once('error', reject);
+      worker.once('exit', (code) => reject(new Error(`HEIC worker exited with code ${code}`)));
     });
-    return sharp(pixels, { ...SHARP_OPTS, raw: { width, height, channels: 4 } });
+    if (result.error === 'too-large') throw userError('This image is too large (over 50 megapixels).');
+    if (result.error === 'empty') throw userError('No image found in this HEIC file.');
+    if (result.error) throw userError('Could not read this HEIC file. It may be damaged.');
+    const { width, height, pixels } = result;
+    return sharp(Buffer.from(pixels), { ...SHARP_OPTS, raw: { width, height, channels: 4 } });
   } finally {
-    images.forEach((img) => {
-      try { img.free(); } catch { /* already released */ }
-    });
-    if (decoder.decoder) {
-      libheif.heif_context_free(decoder.decoder);
-      decoder.decoder = null;
-    }
+    clearTimeout(timer);
+    await worker.terminate();
   }
 }
 
