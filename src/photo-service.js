@@ -88,6 +88,21 @@ function coarseGps(lat, lon) {
   return { latitude: Math.round(la * 1000) / 1000, longitude: Math.round(lo * 1000) / 1000 };
 }
 
+// Largest image size declared in a HEIF/HEIC container. Every image item has
+// an 'ispe' (image spatial extents) property: 4-byte size, 'ispe', 4 bytes of
+// version/flags, then width and height. These are what the decoder uses, so
+// unlike EXIF they can't understate the real size. Returns 0 if none found.
+function heifMaxPixels(buffer) {
+  let max = 0;
+  for (let i = buffer.indexOf('ispe'); i !== -1; i = buffer.indexOf('ispe', i + 4)) {
+    if (i < 4 || i + 16 > buffer.length) continue;
+    const width = buffer.readUInt32BE(i + 8);
+    const height = buffer.readUInt32BE(i + 12);
+    max = Math.max(max, width * height);
+  }
+  return max;
+}
+
 const clip = (value, max = 100) => String(value || '').trim().slice(0, max);
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/;
 
@@ -238,12 +253,15 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
           .toBuffer();
         finalMimeType = 'image/webp';
       } catch (error) {
+        // sharp refused it for size: never retry with a decoder that has no limit.
+        if (/pixel limit/i.test(error.message)) {
+          throw userError('This image is too large (over 50 megapixels).');
+        }
         console.log('Sharp failed, trying heic-convert:', error.message);
         // Fallback to heic-convert, which has no size limit of its own: only
-        // run it when EXIF says the image is within the pixel budget.
-        const w = Number(exifData.ExifImageWidth || exifData.ImageWidth || 0);
-        const h = Number(exifData.ExifImageHeight || exifData.ImageHeight || 0);
-        if (!w || !h || w * h > MAX_INPUT_PIXELS) {
+        // run it when the container's own declared size is within budget.
+        const pixels = heifMaxPixels(buffer);
+        if (!pixels || pixels > MAX_INPUT_PIXELS) {
           throw userError('This HEIC file is too large or unreadable. Export it as JPEG and try again.');
         }
         try {
