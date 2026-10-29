@@ -1,14 +1,19 @@
 // Standalone upload service for the website dashboard.
 //   npm run start:upload
-// Serves POST /upload, DELETE /photos/:id, GET /healthz and a simple upload page
-// at GET /. Needs Firebase Admin + R2 credentials, but no Telegram bot token, so
-// it can run (and keep running) without the Telegram bot.
+// Serves POST /upload, DELETE /photos/:id, GET /photos/:id/original, GET /healthz
+// and a simple upload page at GET /. Needs Firebase Admin + R2 credentials. With
+// TELEGRAM_BOT_TOKEN and TELEGRAM_ARCHIVE_CHAT_ID set it also keeps each
+// original in a Telegram channel (see telegram-archive.js); the Telegram bot
+// itself doesn't have to run.
 require('dotenv').config();
 const http = require('http');
 const { URL } = require('url');
 const crypto = require('crypto');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
 const Busboy = require('busboy');
 const photoService = require('./photo-service');
+const telegramArchive = require('./telegram-archive');
 
 const UPLOAD_SECRET = process.env.UPLOAD_SECRET || '';
 
@@ -392,6 +397,11 @@ const runExclusive = (task) => {
   return run;
 };
 
+// Caption for the archived original, so the channel can be browsed on its own.
+function archiveCaption(fileName, caption, exifOverrides) {
+  return [fileName, exifOverrides.date, exifOverrides.device, caption].filter(Boolean).join('\n');
+}
+
 async function handleUpload(req, res) {
   if (!(await authorize(req))) {
     refuse(req, res, 401, 'Unauthorized');
@@ -408,6 +418,8 @@ async function handleUpload(req, res) {
   try {
     busboy = Busboy({
       headers: req.headers,
+      // Browsers send file names as UTF-8 (busboy assumes Latin-1).
+      defParamCharset: 'utf8',
       limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 20, fieldSize: 2048, parts: 25, fieldNameSize: 50 },
     });
   } catch {
@@ -457,12 +469,38 @@ async function handleUpload(req, res) {
       sendJSON(res, 400, { error: 'No file received' });
       return;
     }
+    // The untouched original goes to the Telegram archive while the photo is
+    // processed, and is linked to the photo once both are done.
+    const archiving = telegramArchive.enabled
+      ? telegramArchive
+          .archiveOriginal({ buffer: fileBuffer, fileName, mimeType, caption: archiveCaption(fileName, caption, exifOverrides) })
+          .catch((err) => {
+            console.error('❌ Original not archived:', err.message);
+            return null;
+          })
+      : Promise.resolve(null);
     try {
       const { message, id } = await runExclusive(() =>
         photoService.processPhotoBuffer(fileBuffer, fileName, mimeType, caption, exifOverrides)
       );
-      sendJSON(res, 200, { success: true, message, id });
+      // 'kept' | 'failed' | 'off' (archive not configured)
+      let original = telegramArchive.enabled ? 'failed' : 'off';
+      const archived = await archiving;
+      if (archived) {
+        try {
+          await photoService.db.collection('photos').doc(id).update({ original: archived });
+          original = 'kept';
+        } catch (err) {
+          console.error('❌ Could not link the archived original:', err.message);
+          telegramArchive.deleteArchived(archived).catch(() => {});
+        }
+      }
+      sendJSON(res, 200, { success: true, message, id, original });
     } catch (err) {
+      // No photo, so no archived original either.
+      archiving
+        .then((archived) => archived && telegramArchive.deleteArchived(archived))
+        .catch((cleanupErr) => console.error('❌ Could not remove an orphaned original:', cleanupErr.message));
       // Details stay in the server log; the client gets a plain message.
       console.error('❌ Web upload error:', err.message);
       sendJSON(res, err.statusCode || 500, { error: err.publicMessage || 'Upload failed. Try again, or try a different file.' });
@@ -486,6 +524,54 @@ async function handleDelete(req, res, photoId) {
     console.error('❌ Delete error:', err.message);
     sendJSON(res, err.statusCode || 500, { error: err.publicMessage || 'Delete failed. Try again.' });
   }
+}
+
+// ─── Web: GET /photos/:id/original handler ──────────────────────────────────
+// Streams the archived original back from Telegram, always as a download.
+function contentDisposition(fileName) {
+  const name = String(fileName || 'original').replace(/[\r\n]/g, '');
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+async function handleOriginalDownload(req, res, photoId) {
+  if (!(await authorize(req))) {
+    refuse(req, res, 401, 'Unauthorized');
+    return;
+  }
+  const snap = await photoService.db.collection('photos').doc(photoId).get();
+  const original = snap.exists ? snap.data().original : null;
+  if (!original?.fileId) {
+    sendJSON(res, 404, { error: 'No original was kept for this photo' });
+    return;
+  }
+  if (Number(original.size) > telegramArchive.MAX_DOWNLOAD_BYTES) {
+    sendJSON(res, 413, { error: 'Originals over 20 MB can only be downloaded in Telegram', link: original.link || '' });
+    return;
+  }
+  if (!telegramArchive.enabled) {
+    sendJSON(res, 503, { error: 'The Telegram archive is not configured on the server', link: original.link || '' });
+    return;
+  }
+
+  let download;
+  try {
+    download = await telegramArchive.downloadArchived(original);
+  } catch (err) {
+    console.error('❌ Original download error:', err.message);
+    sendJSON(res, 502, { error: 'Could not fetch the original from Telegram. Try again.', link: original.link || '' });
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': 'application/octet-stream',
+    'content-disposition': contentDisposition(original.fileName),
+    'cache-control': 'private, no-store',
+    ...(download.headers.get('content-length') ? { 'content-length': download.headers.get('content-length') } : {}),
+  });
+  await pipeline(Readable.fromWeb(download.body), res).catch((err) => {
+    console.error('❌ Original download interrupted:', err.message);
+    res.destroy();
+  });
 }
 
 // ─── CORS headers ────────────────────────────────────────────────────────────
@@ -557,6 +643,14 @@ function handleWebRoutes(req, res, url) {
     handleDelete(req, res, deleteMatch[1]).catch((err) => {
       console.error('❌ Delete handler error:', err.message);
       sendJSON(res, 500, { error: 'Delete failed. Try again.' });
+    });
+    return true;
+  }
+  const originalMatch = url.pathname.match(/^\/photos\/([A-Za-z0-9_-]{1,128})\/original$/);
+  if (req.method === 'GET' && originalMatch) {
+    handleOriginalDownload(req, res, originalMatch[1]).catch((err) => {
+      console.error('❌ Original download handler error:', err.message);
+      sendJSON(res, 500, { error: 'Download failed. Try again.' });
     });
     return true;
   }

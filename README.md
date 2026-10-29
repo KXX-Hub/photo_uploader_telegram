@@ -6,7 +6,7 @@ entry points that share `src/photo-service.js`:
 
 | Service | Start command | Needs Telegram? | What it serves |
 | --- | --- | --- | --- |
-| Upload service | `npm run start:upload` | No | `POST /upload`, `DELETE /photos/:id`, `GET /healthz`, upload page at `GET /` (used by the website dashboard) |
+| Upload service | `npm run start:upload` | Only for the original archive | `POST /upload`, `DELETE /photos/:id`, `GET /photos/:id/original`, `GET /healthz`, upload page at `GET /` (used by the website dashboard) |
 | Telegram bot | `npm start` | Yes | Photos sent to the bot, plus the same web routes unless `ENABLE_WEB_UPLOAD=false` |
 
 The website dashboard only needs the upload service.
@@ -43,11 +43,31 @@ npm start
      (optional `R2_OBJECT_PREFIX`, `R2_ORIGINALS_PREFIX`, `R2_THUMBNAILS_PREFIX`)
    - Access: allowed Google accounts come from Firestore `settings/dashboard_auth`;
      optional `ADMIN_EMAILS`, `UPLOAD_SECRET` (for the page at `GET /`), `CORS_ORIGIN`
-   - `TELEGRAM_BOT_TOKEN` is **not** needed.
+   - Optional original archive: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ARCHIVE_CHAT_ID`
+     (see below). Without them the service runs without Telegram.
 3. Point the website at it: set `REACT_APP_UPLOAD_URL=https://<upload-service-domain>` in
    kxx-profile's `.env` (or Vercel env) and redeploy the site.
 4. When you no longer want the Telegram bot, pause or delete the bot service on Koyeb.
    If you keep it, set `ENABLE_WEB_UPLOAD=false` on it so only one service handles uploads.
+
+## Keep originals in a Telegram channel (optional)
+
+The site only stores resized WebP copies. To also keep every original, byte for
+byte with its EXIF, the upload service can post it as a file to a private
+Telegram channel. Nobody chats with the bot; it's only the key for the API.
+
+1. Create a private Telegram channel.
+2. Add your bot (from @BotFather) to it as an admin that can post and delete messages.
+3. Find the channel id (forward one of its posts to @userinfobot); it looks like
+   `-1001234567890`.
+4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ARCHIVE_CHAT_ID` on the upload service.
+
+Each web upload is then posted to the channel, and its photo document gets an
+`original` field (message id, file id, name, size, link). The dashboard can
+download originals up to 20 MB (`GET /photos/:id/original`); bigger ones open
+in Telegram, since bots can't fetch files over 20 MB. Deleting a photo also
+deletes its original from the channel. Uploads are capped at 50 MB, Telegram's
+limit for bots.
 
 ## Deploy the Telegram bot to Koyeb (Webhook Mode)
 
@@ -127,3 +147,4 @@ Then send a message/photo to the bot and confirm it is processed.
 - `TELEGRAM_ALLOWED_USER_IDS`: Comma-separated Telegram user IDs allowed to use the bot
 - `ENABLE_WEB_UPLOAD`: Set to `false` on the bot when the upload service runs separately
 - `ADMIN_EMAILS`, `UPLOAD_SECRET`, `CORS_ORIGIN`: Upload service access (see above)
+- `TELEGRAM_ARCHIVE_CHAT_ID`: Channel that keeps the originals of web uploads (see above)
