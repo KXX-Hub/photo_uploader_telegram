@@ -1,6 +1,7 @@
 // Photo pipeline shared by the upload server and the Telegram bot:
 // EXIF reading, format conversion, WebP compression, R2 storage and Firestore.
-// Needs Firebase Admin and R2 credentials only (no Telegram token).
+// Needs Firebase Admin and R2 credentials; deleting a photo also removes its
+// archived original when the Telegram archive is set up (telegram-archive.js).
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const { getAuth } = require('firebase-admin/auth');
@@ -12,6 +13,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const telegramArchive = require('./telegram-archive');
 
 // Initialize Firebase Admin
 if (!getApps().length) {
@@ -583,7 +585,9 @@ async function processPhotoBuffer(buffer, fileName, mimeType, caption, exifOverr
   }
 }
 
-// Delete a photo everywhere: both R2 objects, then the Firestore document.
+// Delete a photo everywhere: both R2 objects, the archived original in
+// Telegram, then the Firestore document. An original Telegram won't delete
+// stays in the channel, and its link is returned so it can be removed there.
 async function deletePhoto(photoId) {
   const ref = db.collection('photos').doc(photoId);
   const snap = await ref.get();
@@ -608,9 +612,19 @@ async function deletePhoto(photoId) {
   }
 
   await Promise.all(keys.map((Key) => r2Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key }))));
+
+  let originalLeft = null;
+  if (data.original?.provider === 'telegram') {
+    const deleted = await telegramArchive.deleteArchived(data.original).catch((err) => {
+      console.error(`❌ Original of ${photoId} not deleted from Telegram:`, err.message);
+      return false;
+    });
+    if (!deleted) originalLeft = data.original.link || '';
+  }
+
   await ref.delete();
   console.log(`🗑️ Deleted photo ${photoId} (R2 objects: ${keys.join(', ') || 'none'})`);
-  return { id: photoId, deletedObjects: keys };
+  return { id: photoId, deletedObjects: keys, ...(originalLeft !== null ? { originalLeft } : {}) };
 }
 
 module.exports = {
