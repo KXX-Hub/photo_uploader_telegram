@@ -341,15 +341,26 @@ async function authorize(req) {
   if (!token || token.length > 4096) return null;
   if (secretMatches(token)) return { via: 'secret' };
 
+  // Each refusal logs why (never the token), so a 401 can be traced in the
+  // service logs.
+  let decoded;
   try {
-    const decoded = await photoService.auth.verifyIdToken(token);
-    const email = (decoded.email || '').toLowerCase();
-    if (!email || !decoded.email_verified) return null;
-    const allowed = await getAllowedEmails();
-    return allowed.has(email) ? { via: 'firebase', email } : null;
-  } catch {
+    decoded = await photoService.auth.verifyIdToken(token);
+  } catch (err) {
+    console.warn(`🔒 Auth refused: ID token not accepted (${err.code || 'error'}: ${err.message})`);
     return null;
   }
+  const email = (decoded.email || '').toLowerCase();
+  if (!email || !decoded.email_verified) {
+    console.warn(`🔒 Auth refused: ${email || 'token has no email'} is not a verified email`);
+    return null;
+  }
+  const allowed = await getAllowedEmails();
+  if (!allowed.has(email)) {
+    console.warn(`🔒 Auth refused: ${email} is not on the dashboard allowlist (${allowed.size} allowed)`);
+    return null;
+  }
+  return { via: 'firebase', email };
 }
 
 // Sends at most one response per request, so an error raised after a reply
